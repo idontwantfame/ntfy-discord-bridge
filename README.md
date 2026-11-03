@@ -30,6 +30,7 @@ A service that forwards notifications from [ntfy](https://ntfy.sh/) topics to Di
   - [Remove a mapping](#remove-a-mapping)
   - [Local CLI usage (without Docker)](#local-cli-usage-without-docker)
 - [Configuration](#configuration)
+- [Prebuilt Image](#prebuilt-image)
 - [How It Works](#how-it-works)
 - [Development](#development)
 
@@ -226,6 +227,23 @@ The service is configured with environment variables:
 | `LOG_LEVEL` | `INFO` | Log verbosity: `DEBUG`, `INFO`, `WARNING` or `ERROR` |
 
 The Docker container runs as an unprivileged user (`app`, uid 1000). On start, it hands the data directory to that user, so volumes created by older, root-run versions keep working. Note that this changes the owner of a bind-mounted data directory on the host to uid 1000.
+
+## Prebuilt Image
+
+Once the tests pass, the `Publish image` GitHub workflow builds the image for `linux/amd64` and `linux/arm64` and publishes it to the GitHub Container Registry as `ghcr.io/<owner>/<repository>`:
+
+| Trigger | Image tags |
+|---------|------------|
+| Push to `main` | `latest`, `main`, `sha-<commit>` |
+| Git tag `vX.Y.Z` | `X.Y.Z`, `X.Y`, `sha-<commit>` |
+
+To use it instead of building locally, replace the `build:` section of `docker-compose.yml` with:
+
+```yaml
+    image: ghcr.io/<owner>/<repository>:latest
+```
+
+Check the package's visibility in its settings on GitHub: make it public to pull the image without logging in to GHCR.
 
 ## How It Works
 

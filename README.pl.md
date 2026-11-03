@@ -30,6 +30,7 @@ Serwis przekierowujący powiadomienia z tematów [ntfy](https://ntfy.sh/) do web
   - [Usuń mapowanie](#usuń-mapowanie)
   - [Lokalne użycie CLI (bez Dockera)](#lokalne-użycie-cli-bez-dockera)
 - [Konfiguracja](#konfiguracja)
+- [Gotowy obraz](#gotowy-obraz)
 - [Jak to działa](#jak-to-działa)
 - [Rozwój](#rozwój)
 
@@ -226,6 +227,23 @@ Serwis konfiguruje się za pomocą zmiennych środowiskowych:
 | `LOG_LEVEL` | `INFO` | Szczegółowość logów: `DEBUG`, `INFO`, `WARNING` lub `ERROR` |
 
 Kontener Dockera działa jako nieuprzywilejowany użytkownik (`app`, uid 1000). Przy starcie przekazuje mu katalog danych, więc wolumeny utworzone przez starsze wersje działające jako root nadal działają. Uwaga: zmienia to właściciela zamontowanego katalogu danych na hoście na uid 1000.
+
+## Gotowy obraz
+
+Po pomyślnym przejściu testów workflow GitHub `Publish image` buduje obraz dla `linux/amd64` i `linux/arm64` i publikuje go w GitHub Container Registry jako `ghcr.io/<właściciel>/<repozytorium>`:
+
+| Wyzwalacz | Tagi obrazu |
+|-----------|-------------|
+| Push do `main` | `latest`, `main`, `sha-<commit>` |
+| Tag git `vX.Y.Z` | `X.Y.Z`, `X.Y`, `sha-<commit>` |
+
+Aby użyć go zamiast budować lokalnie, zastąp sekcję `build:` w `docker-compose.yml`:
+
+```yaml
+    image: ghcr.io/<właściciel>/<repozytorium>:latest
+```
+
+Sprawdź widoczność pakietu w jego ustawieniach na GitHubie: ustaw go jako publiczny, aby pobierać obraz bez logowania do GHCR.
 
 ## Jak to działa
 
