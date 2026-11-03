@@ -3,84 +3,71 @@
 
 import argparse
 import asyncio
-import base64
 import sys
+from collections.abc import Sequence
 
 from rich.console import Console
 from rich.table import Table
 
 from app.core import database
+from app.core.auth import build_auth_header, describe_auth
 from app.core.logging import log
+from app.core.validation import (
+    bearer_token,
+    http_url,
+    non_empty,
+    ntfy_topic,
+    server_url,
+)
+from app.discord import mask_webhook
 
 console = Console()
 
 
-def build_auth_header(
-    basic_creds: tuple[str, str] | None = None,
-    token: str | None = None,
-) -> str | None:
-    """Build the authentication header for Ntfy.
-
-    Args:
-        basic_creds: The basic credentials (username, password).
-        token: The token.
-
-    Returns:
-        The authentication header.
-
-    """
-    if basic_creds:
-        user, password = basic_creds
-        creds_str = f"{user}:{password}"
-        encoded_creds = base64.b64encode(creds_str.encode()).decode()
-        return f"Basic {encoded_creds}"
-    if token:
-        return f"Bearer {token}"
-    return None
-
-
-async def cli_add(args: argparse.Namespace) -> None:
+async def cli_add(args: argparse.Namespace) -> bool:
     """Handle the 'add' command.
 
     Args:
         args: The arguments.
 
+    Returns:
+        True if the mapping was added, False if it already exists.
+
     """
     auth_header = build_auth_header(args.basic, args.token)
-    success = await database.add_mapping(
+    return await database.add_mapping(
         args.server,
         args.topic,
         args.webhook,
         auth_header,
     )
-    if not success:
-        sys.exit(1)  # Exit with error code if mapping already exists
 
 
-async def cli_remove(args: argparse.Namespace) -> None:
+async def cli_remove(args: argparse.Namespace) -> bool:
     """Handle the 'remove' command.
 
     Args:
         args: The arguments.
 
+    Returns:
+        True if the mapping was removed, False if it does not exist.
+
     """
-    success = await database.remove_mapping(args.id)
-    if not success:
-        sys.exit(1)
+    return await database.remove_mapping(args.id)
 
 
-async def cli_list(args: argparse.Namespace) -> None:
+async def cli_list(_args: argparse.Namespace) -> bool:
     """Handle the 'list' command.
 
-    Args:
-        args: The arguments.
+    Returns:
+        Always True.
 
     """
     mappings = await database.list_mappings()
 
     if not mappings:
         console.print("No active mappings.", style="yellow")
-        return
+        return True
 
     table = Table(title="Active Ntfy -> Discord Mappings")
     table.add_column("ID", style="cyan", justify="right")
@@ -90,27 +77,25 @@ async def cli_list(args: argparse.Namespace) -> None:
     table.add_column("Auth", style="dim")
 
     for m in mappings:
-        # Hide credentials in logs
-        auth_display = "None"
-        if m["ntfy_auth_header"]:
-            if m["ntfy_auth_header"].startswith("Basic"):
-                auth_display = "Basic (User/Pass)"
-            elif m["ntfy_auth_header"].startswith("Bearer"):
-                auth_display = "Bearer Token"
-
         table.add_row(
             str(m["id"]),
             m["ntfy_server"],
             m["ntfy_topic"],
-            m["discord_webhook"][:30] + "...",  # Shorten webhook for readability
-            auth_display,
+            mask_webhook(m["discord_webhook"]),
+            describe_auth(m["ntfy_auth_header"]),
         )
 
     console.print(table)
+    return True
 
 
-def main() -> None:
-    """Main function."""
+def _build_parser() -> argparse.ArgumentParser:
+    """Build the command-line parser.
+
+    Returns:
+        The parser with the add, remove and list commands.
+
+    """
     parser = argparse.ArgumentParser(
         description="CLI for managing the Ntfy-Discord bridge",
     )
@@ -120,35 +105,44 @@ def main() -> None:
         help="Available commands",
     )
 
-    # Polecenie 'add'
+    # 'add' command
     parser_add = subparsers.add_parser("add", help="Add a new mapping")
     parser_add.add_argument(
         "--server",
         required=True,
+        type=server_url,
         help="Ntfy server URL (e.g. https://ntfy.sh)",
     )
-    parser_add.add_argument("--topic", required=True, help="Nazwa tematu Ntfy")
+    parser_add.add_argument(
+        "--topic",
+        required=True,
+        type=ntfy_topic,
+        help="Ntfy topic name",
+    )
     parser_add.add_argument(
         "--webhook",
         required=True,
-        help="Pełny URL webhooka Discord",
+        type=http_url,
+        help="Full Discord webhook URL",
     )
 
     auth_group = parser_add.add_mutually_exclusive_group()
     auth_group.add_argument(
         "--basic",
         nargs=2,
+        type=non_empty,
         metavar=("USER", "PASS"),
         help="Authentication Basic (username/password)",
     )
     auth_group.add_argument(
         "--token",
+        type=bearer_token,
         metavar="TOKEN",
         help="Authentication Bearer Token",
     )
     parser_add.set_defaults(func=cli_add)
 
-    # Polecenie 'remove'
+    # 'remove' command
     parser_remove = subparsers.add_parser("remove", help="Remove a mapping")
     parser_remove.add_argument(
         "--id",
@@ -158,22 +152,42 @@ def main() -> None:
     )
     parser_remove.set_defaults(func=cli_remove)
 
-    # Polecenie 'list'
-    parser_list = subparsers.add_parser(
-        "list",
-        help="List all active mappings",
-    )
+    # 'list' command
+    parser_list = subparsers.add_parser("list", help="List all active mappings")
     parser_list.set_defaults(func=cli_list)
 
-    args = parser.parse_args()
+    return parser
 
-    # Use asyncio.run() to call the asynchronous CLI function
+
+async def _run(args: argparse.Namespace) -> bool:
+    """Make sure the database exists, then run the selected command.
+
+    Returns:
+        Whether the command succeeded.
+
+    """
+    await database.init_db()
+    return await args.func(args)
+
+
+def main(argv: Sequence[str] | None = None) -> int:
+    """Main function.
+
+    Args:
+        argv: Command-line arguments, defaulting to sys.argv.
+
+    Returns:
+        The process exit code.
+
+    """
+    args = _build_parser().parse_args(argv)
     try:
-        asyncio.run(args.func(args))
+        success = asyncio.run(_run(args))
     except Exception as e:  # noqa: BLE001 # pylint: disable=broad-exception-caught
-        log.error(f"CLI error: {e}", exc_info=True)
-        sys.exit(1)
+        log.error("CLI error: %s", e, exc_info=True)
+        return 1
+    return 0 if success else 1
 
 
 if __name__ == "__main__":
-    main()
+    sys.exit(main())

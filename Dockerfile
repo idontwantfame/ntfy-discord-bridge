@@ -1,14 +1,16 @@
 FROM python:3.11-slim
 
-# Install uv.
-COPY --from=ghcr.io/astral-sh/uv:latest /uv /uvx /bin/
+# Install uv (pinned for reproducible builds).
+COPY --from=ghcr.io/astral-sh/uv:0.13.6 /uv /uvx /bin/
+
+WORKDIR /app
+
+# Install the dependencies first, so this layer stays cached across code changes.
+COPY pyproject.toml uv.lock .python-version ./
+RUN uv sync --frozen --no-cache --no-dev --no-install-project
 
 # Copy the application into the container.
 COPY . /app
-
-# Install the application dependencies.
-WORKDIR /app
-RUN uv sync --frozen --no-cache
 
 # Make cli.py executable and create a symlink in venv bin for easy access
 RUN chmod +x /app/cli.py && \
@@ -18,4 +20,4 @@ RUN chmod +x /app/cli.py && \
 ENV PATH="/app/.venv/bin:${PATH}"
 
 # Run the application.
-CMD ["sh", "-c", "exec /app/.venv/bin/python main.py"]
+CMD ["python", "main.py"]

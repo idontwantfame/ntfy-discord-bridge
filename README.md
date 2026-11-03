@@ -29,7 +29,9 @@ A service that forwards notifications from [ntfy](https://ntfy.sh/) topics to Di
     - [With Bearer token authentication](#with-bearer-token-authentication)
   - [Remove a mapping](#remove-a-mapping)
   - [Local CLI usage (without Docker)](#local-cli-usage-without-docker)
+- [Configuration](#configuration)
 - [How It Works](#how-it-works)
+- [Development](#development)
 
 
 ## Overview
@@ -42,8 +44,11 @@ A service that forwards notifications from [ntfy](https://ntfy.sh/) topics to Di
 - **Smart notification classification**: Automatically detects notification types (info, success, warning, error) based on priority and tags.
 - **Rich Discord embeds**: Color-coded messages with emojis for visual distinction.
 - Supports authenticated ntfy servers (Basic and Bearer).
-- Dynamic management: add or remove mappings at runtime without restart.
-- Robust error handling and automatic reconnection/backoff.
+- Dynamic management: add or remove mappings at runtime without restart (picked up within 30 seconds).
+- Robust error handling and automatic reconnection with exponential backoff.
+- No lost notifications on reconnect: the bridge resumes where the interrupted stream left off.
+- Respects Discord rate limits and retries failed deliveries.
+- Secrets stay out of logs: webhook tokens and ntfy credentials are never printed.
 - Simple management CLI (`cli.py`): add/list/remove topic-to-webhook mappings.
 - Easy deployment with Docker/Docker Compose.
 - Written in Python 3.11+.
@@ -61,10 +66,10 @@ The bridge automatically classifies notifications into different types based on 
 
 | Type | Priority | Tags | Discord Color | Emoji | Description |
 |------|----------|------|---------------|-------|-------------|
-| **Error** | 5 / `urgent` | `error`, `skull`, `rotating_light`, `fire`, `boom` | 🔴 Red | ❌ | Critical alerts requiring immediate attention |
+| **Error** | 5 / `max`, `urgent` | `error`, `skull`, `rotating_light`, `fire`, `boom` | 🔴 Red | ❌ | Critical alerts requiring immediate attention |
 | **Warning** | 4 / `high` | `warning`, `exclamation`, `construction` | 🟡 Yellow | ⚠️ | Important notifications that should be noticed |
 | **Success** | Any | `white_check_mark`, `heavy_check_mark`, `partying_face`, `tada`, `check` | 🟢 Green | ✅ | Success confirmations and positive events |
-| **Info** | 1-3 / `default`, `low`, `minimal` | (none) | 🔵 Blue | ℹ️ | General informational messages |
+| **Info** | 1-3 / `min`, `low`, `default` | (none) | 🔵 Blue | ℹ️ | General informational messages |
 
 **Note:** Tags take precedence over priority when determining notification type. For example, a message with `Priority: urgent` and `Tags: warning` will be displayed as a warning (yellow) rather than an error (red).
 
@@ -150,7 +155,7 @@ This will display a table with:
 - **ID**: Unique identifier for each mapping
 - **Ntfy Server**: The ntfy server URL
 - **Ntfy Topic**: The topic name
-- **Discord Webhook**: The Discord webhook URL (truncated for security)
+- **Discord Webhook**: The Discord webhook URL, with its secret token hidden
 - **Auth**: Authentication method used (None, Basic, or Bearer Token)
 
 ### Add a new mapping
@@ -194,25 +199,31 @@ docker exec -it ntfy-discord-bridge cli remove --id 1
 
 ### Local CLI usage (without Docker)
 
-If you're running the service locally, you can use the CLI directly:
+If you're running the service locally, you can use the CLI directly. By default, the database is stored in `data/bridge.db` inside the project directory:
 
 ```bash
 # Make sure dependencies are installed
 uv sync
 
 # Use the CLI
-python cli.py list
-python cli.py add --server https://ntfy.sh --topic test --webhook <WEBHOOK_URL>
-python cli.py remove --id 1
+uv run cli.py list
+uv run cli.py add --server https://ntfy.sh --topic test --webhook <WEBHOOK_URL>
+uv run cli.py remove --id 1
+
+# Run the bridge itself
+uv run main.py
 ```
 
-Or if the file is executable:
+The CLI validates its input: the server and webhook must be `http(s)://` URLs, and topic names may only contain letters, digits, `-` and `_` (up to 64 characters, or several comma-separated topics).
 
-```bash
-./cli.py list
-./cli.py add --server https://ntfy.sh --topic test --webhook <WEBHOOK_URL>
-./cli.py remove --id 1
-```
+## Configuration
+
+The service is configured with environment variables:
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `DB_PATH` | `data/bridge.db` in the project directory (`/app/data/bridge.db` in Docker) | Path of the SQLite database holding the mappings |
+| `LOG_LEVEL` | `INFO` | Log verbosity: `DEBUG`, `INFO`, `WARNING` or `ERROR` |
 
 ## How It Works
 
@@ -222,7 +233,19 @@ Or if the file is executable:
 4. **Format for Discord**: Messages are formatted as Discord embeds with appropriate colors and emojis.
 5. **Forward to Discord**: Formatted messages are sent to configured Discord webhooks.
 
-The service automatically handles reconnections, retries, and error recovery, ensuring reliable message delivery.
+The service automatically handles reconnections, retries, and error recovery:
+
+- A dropped or silent ntfy connection (no keepalive for 90 seconds) is re-established with exponential backoff, and the bridge asks ntfy for every message published while it was disconnected. This resume point lives in memory, so messages published while the bridge itself is stopped (e.g. during a restart or redeploy) are not replayed.
+- Authentication or "topic not found" errors are retried every 5 minutes, so a misconfigured mapping does not hammer the ntfy server.
+- Discord rate limits and server errors are retried up to 3 times; messages Discord rejects outright (e.g. a deleted webhook) are logged and skipped.
+
+## Development
+
+```bash
+uv sync                          # install runtime and development dependencies
+uv run pytest --cov=app --cov=cli  # run the tests with coverage
+uv run ruff check .              # lint
+```
 
 ---
 

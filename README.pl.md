@@ -29,7 +29,9 @@ Serwis przekierowujący powiadomienia z tematów [ntfy](https://ntfy.sh/) do web
     - [Z uwierzytelnianiem Bearer token](#z-uwierzytelnianiem-bearer-token)
   - [Usuń mapowanie](#usuń-mapowanie)
   - [Lokalne użycie CLI (bez Dockera)](#lokalne-użycie-cli-bez-dockera)
+- [Konfiguracja](#konfiguracja)
 - [Jak to działa](#jak-to-działa)
+- [Rozwój](#rozwój)
 
 
 ## Przegląd
@@ -42,8 +44,11 @@ Serwis przekierowujący powiadomienia z tematów [ntfy](https://ntfy.sh/) do web
 - **Inteligentna klasyfikacja powiadomień**: Automatycznie wykrywa typy powiadomień (info, sukces, ostrzeżenie, błąd) na podstawie priorytetu i tagów.
 - **Bogate osadzenia Discord**: Wiadomości z kodowaniem kolorów i emoji dla wizualnego rozróżnienia.
 - Obsługuje uwierzytelnione serwery ntfy (Basic i Bearer).
-- Dynamiczne zarządzanie: dodawaj lub usuwaj mapowania w czasie rzeczywistym bez restartu.
-- Solidna obsługa błędów i automatyczne ponowne połączenie/backoff.
+- Dynamiczne zarządzanie: dodawaj lub usuwaj mapowania w czasie rzeczywistym bez restartu (zmiany są wykrywane w ciągu 30 sekund).
+- Solidna obsługa błędów i automatyczne ponowne połączenie z wykładniczym backoffem.
+- Brak utraconych powiadomień przy ponownym połączeniu: most wznawia odbiór w miejscu, w którym przerwano strumień.
+- Respektuje limity zapytań Discorda i ponawia nieudane wysyłki.
+- Sekrety nie trafiają do logów: tokeny webhooków i dane logowania ntfy nigdy nie są wypisywane.
 - Proste narzędzie zarządzania CLI (`cli.py`): dodawaj/wyświetlaj/usuwaj mapowania tematów do webhooków.
 - Łatwe wdrożenie za pomocą Docker/Docker Compose.
 - Napisane w Pythonie 3.11+.
@@ -61,10 +66,10 @@ Most automatycznie klasyfikuje powiadomienia na różne typy na podstawie priory
 
 | Typ | Priorytet | Tagi | Kolor Discord | Emoji | Opis |
 |------|----------|------|---------------|-------|-------------|
-| **Błąd** | 5 / `urgent` | `error`, `skull`, `rotating_light`, `fire`, `boom` | 🔴 Czerwony | ❌ | Krytyczne alerty wymagające natychmiastowej uwagi |
+| **Błąd** | 5 / `max`, `urgent` | `error`, `skull`, `rotating_light`, `fire`, `boom` | 🔴 Czerwony | ❌ | Krytyczne alerty wymagające natychmiastowej uwagi |
 | **Ostrzeżenie** | 4 / `high` | `warning`, `exclamation`, `construction` | 🟡 Żółty | ⚠️ | Ważne powiadomienia, które powinny być zauważone |
 | **Sukces** | Dowolny | `white_check_mark`, `heavy_check_mark`, `partying_face`, `tada`, `check` | 🟢 Zielony | ✅ | Potwierdzenia sukcesu i pozytywne wydarzenia |
-| **Info** | 1-3 / `default`, `low`, `minimal` | (brak) | 🔵 Niebieski | ℹ️ | Ogólne wiadomości informacyjne |
+| **Info** | 1-3 / `min`, `low`, `default` | (brak) | 🔵 Niebieski | ℹ️ | Ogólne wiadomości informacyjne |
 
 **Uwaga:** Tagi mają pierwszeństwo przed priorytetem przy określaniu typu powiadomienia. Na przykład wiadomość z `Priority: urgent` i `Tags: warning` będzie wyświetlana jako ostrzeżenie (żółte) zamiast błędu (czerwone).
 
@@ -150,7 +155,7 @@ To wyświetli tabelę z:
 - **ID**: Unikalny identyfikator każdego mapowania
 - **Serwer Ntfy**: URL serwera ntfy
 - **Temat Ntfy**: Nazwa tematu
-- **Webhook Discord**: URL webhooka Discord (obcięty ze względów bezpieczeństwa)
+- **Webhook Discord**: URL webhooka Discord z ukrytym sekretnym tokenem
 - **Auth**: Metoda uwierzytelniania używana (None, Basic lub Bearer Token)
 
 ### Dodaj nowe mapowanie
@@ -194,25 +199,31 @@ docker exec -it ntfy-discord-bridge cli remove --id 1
 
 ### Lokalne użycie CLI (bez Dockera)
 
-Jeśli uruchamiasz serwis lokalnie, możesz użyć CLI bezpośrednio:
+Jeśli uruchamiasz serwis lokalnie, możesz użyć CLI bezpośrednio. Domyślnie baza danych jest zapisywana w `data/bridge.db` w katalogu projektu:
 
 ```bash
 # Upewnij się, że zależności są zainstalowane
 uv sync
 
 # Użyj CLI
-python cli.py list
-python cli.py add --server https://ntfy.sh --topic test --webhook <WEBHOOK_URL>
-python cli.py remove --id 1
+uv run cli.py list
+uv run cli.py add --server https://ntfy.sh --topic test --webhook <WEBHOOK_URL>
+uv run cli.py remove --id 1
+
+# Uruchom sam most
+uv run main.py
 ```
 
-Lub jeśli plik jest wykonywalny:
+CLI weryfikuje dane wejściowe: serwer i webhook muszą być adresami `http(s)://`, a nazwy tematów mogą zawierać tylko litery, cyfry, `-` i `_` (do 64 znaków lub kilka tematów oddzielonych przecinkami).
 
-```bash
-./cli.py list
-./cli.py add --server https://ntfy.sh --topic test --webhook <WEBHOOK_URL>
-./cli.py remove --id 1
-```
+## Konfiguracja
+
+Serwis konfiguruje się za pomocą zmiennych środowiskowych:
+
+| Zmienna | Domyślnie | Opis |
+|---------|-----------|------|
+| `DB_PATH` | `data/bridge.db` w katalogu projektu (`/app/data/bridge.db` w Dockerze) | Ścieżka bazy SQLite z mapowaniami |
+| `LOG_LEVEL` | `INFO` | Szczegółowość logów: `DEBUG`, `INFO`, `WARNING` lub `ERROR` |
 
 ## Jak to działa
 
@@ -222,7 +233,19 @@ Lub jeśli plik jest wykonywalny:
 4. **Formatuj dla Discord**: Wiadomości są formatowane jako osadzenia Discord z odpowiednimi kolorami i emoji.
 5. **Przekieruj do Discord**: Sformatowane wiadomości są wysyłane do skonfigurowanych webhooków Discord.
 
-Serwis automatycznie obsługuje ponowne połączenia, ponowne próby i odzyskiwanie błędów, zapewniając niezawodną dostawę wiadomości.
+Serwis automatycznie obsługuje ponowne połączenia, ponowne próby i odzyskiwanie błędów:
+
+- Zerwane lub milczące połączenie z ntfy (brak keepalive przez 90 sekund) jest odnawiane z wykładniczym backoffem, a most prosi ntfy o wszystkie wiadomości opublikowane w czasie rozłączenia. Ten punkt wznowienia jest przechowywany w pamięci, więc wiadomości opublikowane, gdy sam most jest zatrzymany (np. podczas restartu lub ponownego wdrożenia), nie są odtwarzane.
+- Błędy uwierzytelniania lub nieistniejącego tematu są ponawiane co 5 minut, więc błędnie skonfigurowane mapowanie nie zasypuje serwera ntfy zapytaniami.
+- Limity zapytań i błędy serwera Discorda są ponawiane do 3 razy; wiadomości odrzucone przez Discorda (np. usunięty webhook) są logowane i pomijane.
+
+## Rozwój
+
+```bash
+uv sync                          # instalacja zależności (w tym deweloperskich)
+uv run pytest --cov=app --cov=cli  # testy z pokryciem kodu
+uv run ruff check .              # linter
+```
 
 ---
 

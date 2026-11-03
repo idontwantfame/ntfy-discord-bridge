@@ -15,4 +15,3 @@ services:
     # Expose as needed if providing an HTTP API or admin, otherwise can be omitted
     # ports:
     #   - "8080:8080"
-    command: ["sh", "-c", "exec /app/.venv/bin/python main.py"]

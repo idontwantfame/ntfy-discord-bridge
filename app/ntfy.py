@@ -2,32 +2,35 @@
 
 import asyncio
 import json
+from collections.abc import AsyncIterator
+from contextlib import aclosing
 from typing import Any
 
-import backoff
 import httpx
 
+from app.core.auth import describe_auth
 from app.core.logging import log
 from app.discord import post_to_discord
 
-# HTTP status code constants
-HTTP_BAD_REQUEST = 400
-HTTP_INTERNAL_SERVER_ERROR = 500
+# Ntfy sends a keepalive event every 45 seconds by default (and servers must stay
+# below the Android app's hardcoded 77 second timeout), so a stream that stays
+# silent for longer than this is considered dead and gets reconnected.
+STREAM_READ_TIMEOUT = 90.0
+CONNECT_TIMEOUT = 10.0
+
+# Reconnect delays in seconds: doubled after each failure, reset by any event
+RETRY_INITIAL_DELAY = 1.0
+RETRY_MAX_DELAY = 300.0
 
 
-async def _process_ntfy_stream(
+async def _iter_events(
     response: httpx.Response,
     mapping_id: int,
-    discord_client: httpx.AsyncClient,
-    webhook_url: str,
-) -> None:
-    """Process lines from Ntfy stream and forward messages to Discord.
+) -> AsyncIterator[dict[str, Any]]:
+    """Yield each event object from a Ntfy JSON stream.
 
-    Args:
-        response: The HTTP response stream.
-        mapping_id: The mapping ID.
-        discord_client: The Discord HTTP client.
-        webhook_url: The Discord webhook URL.
+    Yields:
+        Each event (open, keepalive, message, ...); invalid lines are skipped.
 
     """
     async for line in response.aiter_lines():
@@ -36,173 +39,162 @@ async def _process_ntfy_stream(
 
         try:
             data = json.loads(line)
-            if data.get("event") == "message":
-                log.info(
-                    ("[ID: %(mapping_id)s] Received message: %(title)s"),
-                    {
-                        "mapping_id": mapping_id,
-                        "title": data.get("title"),
-                    },
-                )
-                await post_to_discord(discord_client, webhook_url, data)
-
         except json.JSONDecodeError:
+            data = None
+        if not isinstance(data, dict):
             log.warning(
-                (
-                    "[ID: %(mapping_id)s] Received invalid JSON "
-                    "from Ntfy stream: %(line)s"
-                ),
+                "[ID: %(mapping_id)s] Invalid event in Ntfy stream: %(line)s",
                 {"mapping_id": mapping_id, "line": line},
             )
+            continue
+        yield data
 
 
-@backoff.on_exception(
-    backoff.expo,
-    (httpx.RequestError, httpx.ConnectError),
-    max_time=300,
-)
-async def listen_to_ntfy(mapping: dict[str, Any]) -> None:
-    """Main function listening to Ntfy and forwarding messages to Discord.
+def _resume_point(event: dict[str, Any], since: str | None) -> str | None:
+    """Pick the ``since`` value that a reconnect should resume from.
 
-    Uses backoff to automatically retry connections.
-
-    Args:
-        mapping: The mapping dictionary from the database.
-
-    Raises:
-        httpx.HTTPStatusError: If the HTTP status code is not 200.
-        httpx.RequestError: If the request error occurs.
+    Returns:
+        The ID of the last message received or, before any message arrived,
+        the server time at which the stream opened.
 
     """
-    mapping_id = mapping["id"]
-    server = mapping["ntfy_server"]
-    topic = mapping["ntfy_topic"]
-    webhook_url = mapping["discord_webhook"]
-    auth_header = mapping.get("ntfy_auth_header")
+    if event.get("event") == "message" and event.get("id"):
+        return str(event["id"])
+    if since is None and event.get("event") == "open" and event.get("time"):
+        return str(event["time"])
+    return since
 
-    ntfy_url = f"{server.rstrip('/')}/{topic.lstrip('/')}/json"
-    # Configure headers for optimal streaming connection
-    # - User-Agent: Identifies the client (good practice)
-    # - Accept: Specifies we want NDJSON (newline-delimited JSON) stream format
-    # - Connection: keep-alive: Maintains persistent connection for streaming
-    headers = {
-        "User-Agent": "ntfy-discord-bridge/0.1.0",
-        "Accept": "application/x-ndjson, application/json",
-        "Connection": "keep-alive",
-    }
-    if auth_header:
-        headers["Authorization"] = auth_header
 
-    log.info(
+def _delay_after_status_error(
+    error: httpx.HTTPStatusError,
+    mapping_id: int,
+    ntfy_url: str,
+    delay: float,
+) -> float:
+    """Log an HTTP error from Ntfy and pick the delay before reconnecting.
+
+    Rate limits and server errors are transient and keep the current backoff.
+    Other errors (bad credentials, unknown topic) will not fix themselves
+    quickly, so they wait the maximum delay instead of hammering the server.
+
+    Returns:
+        The delay in seconds before the next connection attempt.
+
+    """
+    status_code = error.response.status_code
+    is_transient = status_code == httpx.codes.TOO_MANY_REQUESTS or (
+        httpx.codes.is_server_error(status_code)
+    )
+    details = {"mapping_id": mapping_id, "status_code": status_code, "url": ntfy_url}
+    if is_transient:
+        log.warning(
+            "[ID: %(mapping_id)s] Ntfy error %(status_code)s for %(url)s. Retrying...",
+            details,
+        )
+        return delay
+
+    log.error(
         (
-            "[ID: %(mapping_id)s] Starting listening to Ntfy: "
-            "%(ntfy_url)s with auth: %(auth_header)r"
+            "[ID: %(mapping_id)s] HTTP status error: %(status_code)s for %(url)s. "
+            "Check credentials/topic. Retrying in %(delay)s seconds..."
         ),
-        {"mapping_id": mapping_id, "ntfy_url": ntfy_url, "auth_header": auth_header},
+        {**details, "delay": RETRY_MAX_DELAY},
     )
+    return RETRY_MAX_DELAY
 
-    # Use a separate Discord session to not block Ntfy connections
-    # Configure timeout for streaming: no read timeout (None) for long-lived streams,
-    # but keep reasonable connect/write timeouts
-    stream_timeout = httpx.Timeout(
-        connect=10.0,  # 10 seconds to establish connection
-        read=None,  # No read timeout for streaming connections
-        write=10.0,  # 10 seconds to write data
-        pool=5.0,  # 5 seconds to get connection from pool
-    )
-    async with (
-        httpx.AsyncClient() as discord_client,
-        httpx.AsyncClient(
-            headers=headers,
-            timeout=stream_timeout,
-        ) as ntfy_client,
-    ):
-        try:
-            async with ntfy_client.stream("GET", ntfy_url) as response:
+
+async def _subscribe(
+    client: httpx.AsyncClient,
+    ntfy_url: str,
+    mapping_id: int,
+) -> AsyncIterator[dict[str, Any]]:
+    """Yield Ntfy events forever, reconnecting whenever the stream drops.
+
+    Every reconnect passes Ntfy a ``since`` parameter (see `_resume_point`), so
+    messages published while disconnected are delivered after reconnecting.
+
+    Yields:
+        Each event received from Ntfy.
+
+    """
+    since: str | None = None
+    delay = RETRY_INITIAL_DELAY
+    while True:
+        params = {"since": since} if since else {}
+        # The try must span the whole stream: read errors surface mid-iteration
+        try:  # noqa: PLW0717
+            async with (
+                client.stream("GET", ntfy_url, params=params) as response,
+                aclosing(_iter_events(response, mapping_id)) as events,
+            ):
                 # Check for 4xx/5xx errors (e.g., bad authorization)
                 response.raise_for_status()
                 log.info(
                     "[ID: %(mapping_id)s] Connected to Ntfy stream: %(ntfy_url)s",
                     {"mapping_id": mapping_id, "ntfy_url": ntfy_url},
                 )
-
-                await _process_ntfy_stream(
-                    response,
-                    mapping_id,
-                    discord_client,
-                    webhook_url,
-                )
-
-        except httpx.HTTPStatusError as e:
-            is_client_error = (
-                HTTP_BAD_REQUEST <= e.response.status_code < HTTP_INTERNAL_SERVER_ERROR
-            )
-            _handle_http_status_error(
-                e,
-                mapping_id,
-                ntfy_url,
-                is_client_error=is_client_error,
-            )
-            # Stop retrying for client errors
-            if is_client_error:
-                return  # End task
-            # Let backoff handle 5xx errors
-            raise
-        except httpx.RequestError as e:
-            error_msg = str(e) or type(e).__name__
+                async for event in events:
+                    # Only a stream that delivers events counts as healthy
+                    delay = RETRY_INITIAL_DELAY
+                    since = _resume_point(event, since)
+                    # Safe: every consumer closes this generator via aclosing()
+                    yield event  # noqa: ASYNC119
             log.warning(
-                ("[ID: %(mapping_id)s] Ntfy connection error: %(error)s. Retrying..."),
-                {"mapping_id": mapping_id, "error": error_msg},
+                "[ID: %(mapping_id)s] Ntfy closed the stream. Reconnecting...",
+                {"mapping_id": mapping_id},
             )
-            raise  # Pass exception to backoff
-        except Exception as e:
-            error_msg = str(e) or type(e).__name__
-            log.error(
-                "[ID: %(mapping_id)s] Unexpected error in listen_to_ntfy: %(error)s",
-                {"mapping_id": mapping_id, "error": error_msg},
-                exc_info=True,
+        except httpx.HTTPStatusError as e:
+            delay = _delay_after_status_error(e, mapping_id, ntfy_url, delay)
+        except httpx.RequestError as e:
+            log.warning(
+                "[ID: %(mapping_id)s] Ntfy connection error: %(error)s. Retrying...",
+                {"mapping_id": mapping_id, "error": str(e) or type(e).__name__},
             )
-            # Give a moment before retry
-            await asyncio.sleep(5)
-            raise  # Retry
+        await asyncio.sleep(delay)
+        delay = min(delay * 2, RETRY_MAX_DELAY)
 
 
-def _handle_http_status_error(
-    error: httpx.HTTPStatusError,
-    mapping_id: int,
-    ntfy_url: str,
-    *,
-    is_client_error: bool,
-) -> None:
-    """Handle HTTP status errors from Ntfy.
+async def listen_to_ntfy(mapping: dict[str, Any]) -> None:
+    """Forward messages from a Ntfy topic to a Discord webhook until cancelled.
 
     Args:
-        error: The HTTP status error.
-        mapping_id: The mapping ID.
-        ntfy_url: The Ntfy URL.
-        is_client_error: Whether this is a client error (4xx).
+        mapping: The mapping dictionary from the database.
 
     """
-    log.error(
-        (
-            "[ID: %(mapping_id)s] HTTP status error: %(status_code)s "
-            "for %(ntfy_url)s. Check credentials/topic."
-        ),
-        {
-            "mapping_id": mapping_id,
-            "status_code": error.response.status_code,
-            "ntfy_url": ntfy_url,
-        },
+    mapping_id = mapping["id"]
+    server = mapping["ntfy_server"]
+    topic = mapping["ntfy_topic"]
+    auth_header = mapping.get("ntfy_auth_header")
+
+    ntfy_url = f"{server.rstrip('/')}/{topic.lstrip('/')}/json"
+    headers = {
+        "User-Agent": "ntfy-discord-bridge/0.1.0",
+        "Accept": "application/x-ndjson, application/json",
+    }
+    if auth_header:
+        headers["Authorization"] = auth_header
+
+    log.info(
+        "[ID: %(mapping_id)s] Starting listening to Ntfy: %(url)s (auth: %(auth)s)",
+        {"mapping_id": mapping_id, "url": ntfy_url, "auth": describe_auth(auth_header)},
     )
-    # Stop retrying for client errors
-    if is_client_error:
-        log.error(
-            (
-                "[ID: %(mapping_id)s] Stopping retries "
-                "due to client error %(status_code)s."
-            ),
-            {
-                "mapping_id": mapping_id,
-                "status_code": error.response.status_code,
-            },
-        )
+
+    # Use a separate Discord session to not block Ntfy connections
+    stream_timeout = httpx.Timeout(CONNECT_TIMEOUT, read=STREAM_READ_TIMEOUT)
+    async with (
+        httpx.AsyncClient() as discord_client,
+        httpx.AsyncClient(
+            headers=headers,
+            timeout=stream_timeout,
+            follow_redirects=True,
+        ) as ntfy_client,
+        aclosing(_subscribe(ntfy_client, ntfy_url, mapping_id)) as events,
+    ):
+        async for event in events:
+            if event.get("event") != "message":
+                continue
+            log.info(
+                "[ID: %(mapping_id)s] Received message: %(title)s",
+                {"mapping_id": mapping_id, "title": event.get("title")},
+            )
+            await post_to_discord(discord_client, mapping["discord_webhook"], event)

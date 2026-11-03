@@ -6,6 +6,17 @@ __pycache__/
 .Python
 env/
 venv/
+.venv/
 .git
+.env
+# Local database (holds webhook URLs and credentials)
+data/
 *.db
 *.db-journal
+*.db-wal
+*.db-shm
+# Development artifacts
+tests/
+.pytest_cache/
+.ruff_cache/
+.coverage

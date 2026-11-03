@@ -8,16 +8,15 @@ import aiosqlite
 
 from app.core.logging import log
 
-# Database path, preferably mounted as a Docker volume
-DB_PATH = os.environ.get("DB_PATH", "/data/bridge.db")
+# Database path, preferably mounted as a Docker volume. Defaults to data/ in the
+# project root, which is /app/data inside the Docker image.
+DEFAULT_DB_PATH = pathlib.Path(__file__).resolve().parents[2] / "data" / "bridge.db"
+DB_PATH = os.environ.get("DB_PATH", str(DEFAULT_DB_PATH))
 
 
 async def init_db() -> None:
     """Create the mappings table if it doesn't exist."""
-    # Ensure the /data directory exists (synchronously, outside async context)
-    db_parent = pathlib.Path(DB_PATH).parent
-    if not db_parent.exists():
-        db_parent.mkdir(exist_ok=True, parents=True)
+    pathlib.Path(DB_PATH).parent.mkdir(exist_ok=True, parents=True)
 
     async with aiosqlite.connect(DB_PATH) as db:
         await db.execute("""
@@ -31,7 +30,6 @@ async def init_db() -> None:
             )
         """)
         await db.commit()
-    log.info("Database initialized at %s", DB_PATH)
 
 
 async def add_mapping(
@@ -65,7 +63,8 @@ async def add_mapping(
             await db.commit()
         log.info("Mapping added: %s/%s -> Discord", server, topic)
     except aiosqlite.IntegrityError:
-        log.warning("Mapping %s/%s -> %s already exists.", server, topic, webhook)
+        # The webhook URL is left out on purpose: it embeds a secret token
+        log.warning("Mapping %s/%s -> this webhook already exists.", server, topic)
         return False
 
     return True

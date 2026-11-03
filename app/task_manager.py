@@ -7,12 +7,17 @@ from app.core import database
 from app.core.logging import log
 from app.ntfy import listen_to_ntfy
 
+# How often the database is checked for added or removed mappings (seconds)
+POLL_INTERVAL = 30
+
 # Dictionary storing active listening tasks (mapping ID -> asyncio task)
 running_tasks: dict[int, asyncio.Task] = {}
 
 
 def _cleanup_failed_tasks() -> list[int]:
     """Check for failed/completed tasks and clean them up.
+
+    Listeners reconnect on their own, so a finished task means it crashed.
 
     Returns:
         List of mapping IDs that failed and should be restarted.
@@ -36,26 +41,27 @@ def _log_task_failure(mapping_id: int, task: asyncio.Task) -> None:
         task: The failed task.
 
     """
-    try:
-        # Retrieve the exception if any
-        exception = task.exception()
-        if exception:
-            log.warning(
-                (
-                    "Task [ID: %(mapping_id)s] has failed: %(error)s. "
-                    "Will restart if mapping still exists."
-                ),
-                {"mapping_id": mapping_id, "error": exception},
-            )
-        else:
-            log.warning(
-                "Task [ID: %(mapping_id)s] has completed unexpectedly.",
-                {"mapping_id": mapping_id},
-            )
-    except Exception as e:  # noqa: BLE001
+    if task.cancelled():
+        log.warning(
+            "Task [ID: %(mapping_id)s] was cancelled unexpectedly.",
+            {"mapping_id": mapping_id},
+        )
+        return
+
+    exception = task.exception()
+    if exception:
         log.error(
-            "Error checking task [ID: %(mapping_id)s]: %(error)s",
-            {"mapping_id": mapping_id, "error": e},
+            (
+                "Task [ID: %(mapping_id)s] has failed: %(error)s. "
+                "Will restart if mapping still exists."
+            ),
+            {"mapping_id": mapping_id, "error": exception},
+            exc_info=exception,
+        )
+    else:
+        log.warning(
+            "Task [ID: %(mapping_id)s] has completed unexpectedly.",
+            {"mapping_id": mapping_id},
         )
 
 
@@ -99,16 +105,26 @@ async def _stop_deleted_listeners(stale_task_ids: set[int]) -> None:
             ("Mapping [ID: %(mapping_id)s] has been deleted, stopping listener..."),
             {"mapping_id": mapping_id},
         )
-        if mapping_id in running_tasks:
-            task = running_tasks.pop(mapping_id)
-            task.cancel()
-            try:
-                await task
-            except asyncio.CancelledError:
-                log.debug(
-                    "Task [ID: %(mapping_id)s] successfully cancelled.",
-                    {"mapping_id": mapping_id},
-                )
+        task = running_tasks.pop(mapping_id)
+        task.cancel()
+        # Unlike awaiting the task, asyncio.wait never swallows a cancellation
+        # of this coroutine itself (e.g. during shutdown)
+        await asyncio.wait([task])
+        if not task.cancelled() and task.exception() is not None:
+            _log_task_failure(mapping_id, task)
+
+
+async def sync_listeners(mappings: list[dict[str, Any]]) -> None:
+    """Start, restart and stop listener tasks to match the given mappings.
+
+    Args:
+        mappings: All mappings currently in the database.
+
+    """
+    failed_task_ids = _cleanup_failed_tasks()
+    current_mapping_ids = {m["id"] for m in mappings}
+    await _stop_deleted_listeners(set(running_tasks) - current_mapping_ids)
+    _start_new_listeners(mappings, failed_task_ids)
 
 
 async def manage_listeners() -> None:
@@ -118,22 +134,8 @@ async def manage_listeners() -> None:
     """
     while True:
         try:
-            log.info("🔄 Checking for database updates...")
-            mappings = await database.list_mappings()
-
-            current_mapping_ids = {m["id"] for m in mappings}
-            active_task_ids = set(running_tasks.keys())
-
-            # Check for failed/completed tasks and clean them up
-            failed_task_ids = _cleanup_failed_tasks()
-
-            # Start new listeners (including restarts for failed tasks)
-            _start_new_listeners(mappings, failed_task_ids)
-
-            # Stop deleted listeners
-            stale_task_ids = active_task_ids - current_mapping_ids
-            await _stop_deleted_listeners(stale_task_ids)
-
+            log.debug("🔄 Checking for database updates...")
+            await sync_listeners(await database.list_mappings())
         except Exception as e:  # noqa: BLE001 # pylint: disable=broad-exception-caught
             log.error(
                 "Error in management loop: %(error)r",
@@ -141,5 +143,4 @@ async def manage_listeners() -> None:
                 exc_info=True,
             )
 
-        # Check database every 30 seconds
-        await asyncio.sleep(30)
+        await asyncio.sleep(POLL_INTERVAL)

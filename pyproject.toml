@@ -6,7 +6,6 @@ readme = "README.md"
 requires-python = ">=3.11"
 dependencies = [
     "aiosqlite>=0.21.0",
-    "backoff>=2.2.1",
     "httpx>=0.28.1",
     "rich>=14.2.0",
     "uvloop>=0.22.1",
@@ -19,12 +18,37 @@ preview = true
 ignore = [
     # "D100",   # Missing docstring in public module
     # "D104",   # Missing docstring in public package
-    "ANN101", # Missing type hint for 'self'
     "D401", # First line of docstring should be in imperative mood: "Main function listening to Ntfy and forwarding messages to Discord.
     "N805",
     "PTH123", # `open()` should be replaced by `Path.open()`
     "CPY001", #Missing copyright notice at top of file
     "PLR6201", #Use a set literal when testing for membership - This rule's fix is marked as unsafe, as the use of a set literal will error at runtime if either the element being tested for membership (the left-hand side) or any element of the sequence (the right-hand side) is unhashable (like lists or dictionaries). While Ruff will attempt to infer the hashability of both sides and skip the fix when it can determine that either side is unhashable, it may not always be able to do so. https://docs.astral.sh/ruff/rules/literal-membership/#literal-membership-plr6201
     "EXE001", # Shebang is present but file is not executable
-    
+]
+
+[tool.ruff.lint.per-file-ignores]
+"tests/**" = [
+    "S101",    # Tests assert
+    "PLR2004", # Magic values are expected in test assertions
+    "SLF001",  # Tests exercise private helpers
+    "INP001",  # tests/ is not a package
+    "D",       # Test names document themselves
+    "DOC",     # Test names document themselves
+    "ANN",     # Fixtures and parametrized arguments need no annotations
+    "S106",    # Fake credentials in tests
+    "RUF029",  # Fakes of async APIs need not await anything
+]
+
+[tool.pytest.ini_options]
+pythonpath = ["."]
+testpaths = ["tests"]
+asyncio_mode = "auto"
+asyncio_default_fixture_loop_scope = "function"
+
+[dependency-groups]
+dev = [
+    "pytest>=9.2.0",
+    "pytest-asyncio>=1.4.1.post1",
+    "pytest-cov>=7.1.0",
+    "ruff>=0.17.3",
 ]

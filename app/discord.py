@@ -1,188 +1,194 @@
 """Discord webhook integration module."""
 
+import asyncio
+import math
 from datetime import UTC, datetime
 from typing import Any
+from urllib.parse import urlsplit
 
 import httpx
 
+from app.classifier import determine_notification_type
 from app.core.logging import log
 
-# Discord embed colors (decimal RGB values)
-COLOR_INFO = 3447003  # Blue
-COLOR_SUCCESS = 3066993  # Green
-COLOR_WARNING = 16776960  # Yellow
-COLOR_ERROR = 15158332  # Red
+# Discord embed field length limits
+TITLE_MAX_LENGTH = 256
+DESCRIPTION_MAX_LENGTH = 4096
 
-# Priority thresholds
-PRIORITY_URGENT = 5
-PRIORITY_HIGH = 4
-
-# Emoji mappings
-EMOJI_INFO = "ℹ️"  # noqa: RUF001
-EMOJI_SUCCESS = "✅"
-EMOJI_WARNING = "⚠️"
-EMOJI_ERROR = "❌"
-
-# Tag sets for notification type detection
-ERROR_TAGS = {"error", "skull", "rotating_light", "fire", "boom"}
-WARNING_TAGS = {"warning", "exclamation", "construction"}
-SUCCESS_TAGS = {
-    "white_check_mark",
-    "heavy_check_mark",
-    "partying_face",
-    "tada",
-    "check",
-}
+# Delivery retries for rate limits, server errors and connection errors
+DISCORD_MAX_ATTEMPTS = 3
+DISCORD_RETRY_DELAY = 2.0  # Seconds, multiplied by the attempt number
+DISCORD_MAX_RETRY_AFTER = 60.0  # Cap on the wait Discord asks for, in seconds
 
 
-def _check_tags_for_type(tags_lower: list[str]) -> tuple[int, str] | None:
-    """Check if tags indicate a specific notification type.
+def mask_webhook(url: str) -> str:
+    """Hide the secret token of a Discord webhook URL for display.
 
     Args:
-        tags_lower: Lowercase list of tags.
+        url: The Discord webhook URL (.../webhooks/<id>/<token>).
 
     Returns:
-        Tuple of (color, emoji) if tags match a type, None otherwise.
+        The URL with its token replaced by asterisks.
 
     """
-    if any(tag in tags_lower for tag in ERROR_TAGS):
-        return (COLOR_ERROR, EMOJI_ERROR)
-    if any(tag in tags_lower for tag in WARNING_TAGS):
-        return (COLOR_WARNING, EMOJI_WARNING)
-    if any(tag in tags_lower for tag in SUCCESS_TAGS):
-        return (COLOR_SUCCESS, EMOJI_SUCCESS)
-    return None
+    parts = urlsplit(url)
+    webhook_path = parts.path.rstrip("/").rpartition("/")[0]
+    return f"{parts.scheme}://{parts.netloc}{webhook_path}/***"
 
 
-def _priority_to_type(priority: int | str) -> tuple[int, str]:
-    """Convert priority to notification type.
+def _truncate(text: str, limit: int) -> str:
+    """Shorten text to a Discord field limit, marking the cut with an ellipsis.
+
+    Returns:
+        The text, at most `limit` characters long.
+
+    """
+    if len(text) <= limit:
+        return text
+    return text[: limit - 1] + "…"
+
+
+def _format_timestamp(unix_time: object) -> str:
+    """Convert Ntfy's Unix time in seconds to ISO 8601.
+
+    Returns:
+        The ISO 8601 timestamp, or the current time if `unix_time` is invalid.
+
+    """
+    if isinstance(unix_time, int | float):
+        try:
+            return datetime.fromtimestamp(unix_time, tz=UTC).isoformat()
+        except (OverflowError, OSError, ValueError):
+            pass  # Out of range: fall back to the current time
+    return datetime.now(UTC).isoformat()
+
+
+def build_discord_payload(ntfy_message: dict[str, Any]) -> dict[str, Any]:
+    """Format a Ntfy message as a Discord webhook payload.
 
     Args:
-        priority: The notification priority.
+        ntfy_message: The Ntfy message dictionary.
 
     Returns:
-        Tuple of (color, emoji).
+        The JSON payload for the Discord webhook.
 
     """
-    # Handle string priorities
-    if isinstance(priority, str):
-        priority_lower = priority.lower()
-        priority_map: dict[str, tuple[int, str]] = {
-            "urgent": (COLOR_ERROR, EMOJI_ERROR),
-            "5": (COLOR_ERROR, EMOJI_ERROR),
-            "high": (COLOR_WARNING, EMOJI_WARNING),
-            "4": (COLOR_WARNING, EMOJI_WARNING),
-        }
-        return priority_map.get(priority_lower, (COLOR_INFO, EMOJI_INFO))
+    # Coerce to str: the stream is external input and must never crash the bridge
+    title = str(ntfy_message.get("title") or "New Ntfy message")
+    message = str(ntfy_message.get("message") or "*No content*")
 
-    # Handle numeric priorities
-    if isinstance(priority, int):
-        if priority >= PRIORITY_URGENT:
-            return (COLOR_ERROR, EMOJI_ERROR)
-        if priority >= PRIORITY_HIGH:
-            return (COLOR_WARNING, EMOJI_WARNING)
-        return (COLOR_INFO, EMOJI_INFO)
+    # Determine notification type based on priority and tags
+    color, emoji = determine_notification_type(
+        ntfy_message.get("priority"),
+        ntfy_message.get("tags"),
+    )
 
-    return (COLOR_INFO, EMOJI_INFO)
+    # Add emoji to title if not already present
+    if not title.startswith(emoji):
+        title = f"{emoji} {title}"
+
+    return {
+        "embeds": [
+            {
+                "title": _truncate(title, TITLE_MAX_LENGTH),
+                "description": _truncate(message, DESCRIPTION_MAX_LENGTH),
+                "color": color,
+                "timestamp": _format_timestamp(ntfy_message.get("time")),
+                "footer": {
+                    "text": f"Ntfy topic: {ntfy_message.get('topic')}",
+                },
+            },
+        ],
+        # Never ping @everyone, roles or users mentioned in a notification
+        "allowed_mentions": {"parse": []},
+    }
 
 
-def _determine_notification_type(
-    priority: int | str | None,
-    tags: list[str] | None,
-) -> tuple[int, str]:
-    """Determine notification type based on priority and tags.
-
-    Args:
-        priority: The notification priority (1-5 or string like "urgent", "high").
-        tags: List of tags associated with the notification.
+def _retry_delay(response: httpx.Response, attempt: int) -> float:
+    """Pick the wait before retrying, honoring Discord's rate limit hints.
 
     Returns:
-        Tuple of (color, emoji) where:
-        - color: Discord embed color (decimal RGB)
-        - emoji: Emoji string for the notification type
+        The delay in seconds.
 
     """
-    tags = tags or []
-    tags_lower = [tag.lower() for tag in tags]
+    try:
+        retry_after = float(
+            response.headers.get("Retry-After") or response.json()["retry_after"],
+        )
+    except (ValueError, KeyError, TypeError):
+        return DISCORD_RETRY_DELAY * attempt
+    if not math.isfinite(retry_after):
+        return DISCORD_RETRY_DELAY * attempt
+    return min(max(retry_after, 0.0), DISCORD_MAX_RETRY_AFTER)
 
-    # Check tags first (they can override priority)
-    tag_result = _check_tags_for_type(tags_lower)
-    if tag_result is not None:
-        return tag_result
 
-    # Determine by priority if no matching tags
-    if priority is None:
-        return (COLOR_INFO, EMOJI_INFO)
+def _is_retryable(status_code: int) -> bool:
+    """Check whether a failed Discord response is worth retrying.
 
-    return _priority_to_type(priority)
+    Returns:
+        True for rate limits and server errors.
+
+    """
+    return status_code == httpx.codes.TOO_MANY_REQUESTS or (
+        httpx.codes.is_server_error(status_code)
+    )
 
 
 async def post_to_discord(
     session: httpx.AsyncClient,
     webhook_url: str,
     ntfy_message: dict[str, Any],
-) -> None:
+) -> bool:
     """Send a formatted Ntfy message to a Discord webhook.
+
+    Rate limits, server errors and connection errors are retried a few times.
+    Other rejections (e.g. a deleted webhook) are logged and the message dropped.
 
     Args:
         session: The HTTP client session.
         webhook_url: The Discord webhook URL.
         ntfy_message: The Ntfy message dictionary.
 
-    Raises:
-        httpx.RequestError: If the request error occurs.
+    Returns:
+        True if Discord accepted the message, False if it was dropped.
 
     """
-    title = ntfy_message.get("title", "New Ntfy message")
-    message = ntfy_message.get("message", "*No content*")
-    priority = ntfy_message.get("priority")
-    tags = ntfy_message.get("tags", [])
+    payload = build_discord_payload(ntfy_message)
+    topic = ntfy_message.get("topic")
 
-    # Determine notification type based on priority and tags
-    color, emoji = _determine_notification_type(priority, tags)
+    for attempt in range(1, DISCORD_MAX_ATTEMPTS + 1):
+        try:
+            response = await session.post(webhook_url, json=payload)
+        except httpx.RequestError as e:
+            log.warning(
+                "Connection error sending to Discord (attempt %(attempt)s): %(error)r",
+                {"attempt": attempt, "error": e},
+            )
+            retry_delay = DISCORD_RETRY_DELAY * attempt
+        else:
+            if response.is_success:
+                log.info(
+                    "Successfully sent message to Discord (topic: %(topic)s)",
+                    {"topic": topic},
+                )
+                return True
+            if not _is_retryable(response.status_code):
+                log.error(
+                    "Discord rejected the message (%(status_code)s): %(text)s",
+                    {"status_code": response.status_code, "text": response.text},
+                )
+                return False
+            retry_delay = _retry_delay(response, attempt)
+            log.warning(
+                "Discord returned %(status_code)s (attempt %(attempt)s)",
+                {"status_code": response.status_code, "attempt": attempt},
+            )
 
-    # Add emoji to title if not already present
-    if not title.startswith(emoji):
-        title = f"{emoji} {title}"
+        if attempt < DISCORD_MAX_ATTEMPTS:
+            await asyncio.sleep(retry_delay)
 
-    # Get timestamp from ntfy message or use current time
-    # Ntfy provides 'time' as Unix timestamp in seconds
-    timestamp = ntfy_message.get("time")
-    if timestamp:
-        # Convert Unix timestamp to ISO 8601 format
-        dt = datetime.fromtimestamp(timestamp, tz=UTC)
-        timestamp_iso = dt.isoformat()
-    else:
-        # Use current time if not provided
-        timestamp_iso = datetime.now(UTC).isoformat()
-
-    # Create a nice payload for Discord
-    payload = {
-        "embeds": [
-            {
-                "title": title,
-                "description": message,
-                "color": color,
-                "timestamp": timestamp_iso,
-                "footer": {
-                    "text": f"Ntfy topic: {ntfy_message.get('topic')}",
-                },
-            },
-        ],
-    }
-
-    try:
-        response = await session.post(webhook_url, json=payload)
-        response.raise_for_status()
-        log.info(
-            "Successfully sent message to Discord (topic: %(topic)s)",
-            {"topic": ntfy_message.get("topic")},
-        )
-    except httpx.HTTPStatusError as e:
-        log.error(
-            "Error sending to Discord (%(status_code)s): %(text)s",
-            {"status_code": e.response.status_code, "text": e.response.text},
-        )
-    except httpx.RequestError as e:
-        log.error("Connection error sending to Discord: %(error)r", {"error": e})
-        raise
+    log.error(
+        "Giving up sending to Discord after %(attempts)s attempts (topic: %(topic)s)",
+        {"attempts": DISCORD_MAX_ATTEMPTS, "topic": topic},
+    )
+    return False
