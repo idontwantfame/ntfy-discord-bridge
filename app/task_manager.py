@@ -5,7 +5,7 @@ from typing import Any
 
 from app.core import database
 from app.core.logging import log
-from app.ntfy import listen_to_ntfy
+from app.listener import listen_to_ntfy
 
 # How often the database is checked for added or removed mappings (seconds)
 POLL_INTERVAL = 30

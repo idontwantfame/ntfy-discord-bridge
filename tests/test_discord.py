@@ -1,11 +1,9 @@
 import httpx
+import pytest
 
 from app.classifier import EMOJI_INFO
-from app.discord import (
-    DISCORD_MAX_ATTEMPTS,
-    build_discord_payload,
-    post_to_discord,
-)
+from app.discord import DISCORD_MAX_ATTEMPTS, post_to_discord
+from app.embed import build_discord_payload
 
 WEBHOOK_URL = "https://discord.com/api/webhooks/123/token"
 MESSAGE = {"title": "Backup", "message": "done", "topic": "alerts"}
@@ -97,12 +95,41 @@ async def test_post_retries_server_errors(replay, sleeps):
     assert len(sleeps) == 1
 
 
-async def test_post_drops_message_rejected_by_discord(replay, sleeps):
-    client, requests = replay(httpx.Response(400, json={"message": "Invalid"}))
+@pytest.mark.parametrize(
+    "outcome",
+    [
+        httpx.Response(400, json={"message": "Invalid"}),
+        httpx.Response(504),  # Discord may have posted it before timing out
+        httpx.ReadTimeout("no response"),
+        httpx.RemoteProtocolError("server disconnected"),
+    ],
+)
+async def test_post_does_not_retry_rejections_or_lost_responses(
+    replay,
+    sleeps,
+    outcome,
+):
+    client, requests = replay(outcome)
     async with client:
         assert not await post_to_discord(client, WEBHOOK_URL, MESSAGE)
     assert len(requests) == 1
     assert sleeps == []
+
+
+@pytest.mark.parametrize(
+    "error",
+    [
+        httpx.ConnectError("refused"),
+        httpx.ConnectTimeout("slow"),
+        httpx.PoolTimeout(""),
+    ],
+)
+async def test_post_retries_requests_that_never_reached_discord(replay, sleeps, error):
+    client, requests = replay(error, httpx.Response(204))
+    async with client:
+        assert await post_to_discord(client, WEBHOOK_URL, MESSAGE)
+    assert len(requests) == 2
+    assert len(sleeps) == 1
 
 
 async def test_post_gives_up_after_repeated_connection_errors(replay, sleeps):

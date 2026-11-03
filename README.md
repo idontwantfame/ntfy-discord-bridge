@@ -46,7 +46,7 @@ A service that forwards notifications from [ntfy](https://ntfy.sh/) topics to Di
 - Supports authenticated ntfy servers (Basic and Bearer).
 - Dynamic management: add or remove mappings at runtime without restart (picked up within 30 seconds).
 - Robust error handling and automatic reconnection with exponential backoff.
-- No lost notifications on reconnect: the bridge resumes where the interrupted stream left off.
+- No lost notifications: the bridge remembers where each stream left off, even across restarts and redeploys.
 - Respects Discord rate limits and retries failed deliveries.
 - Secrets stay out of logs: webhook tokens and ntfy credentials are never printed.
 - Simple management CLI (`cli.py`): add/list/remove topic-to-webhook mappings.
@@ -225,6 +225,8 @@ The service is configured with environment variables:
 | `DB_PATH` | `data/bridge.db` in the project directory (`/app/data/bridge.db` in Docker) | Path of the SQLite database holding the mappings |
 | `LOG_LEVEL` | `INFO` | Log verbosity: `DEBUG`, `INFO`, `WARNING` or `ERROR` |
 
+The Docker container runs as an unprivileged user (`app`, uid 1000). On start, it hands the data directory to that user, so volumes created by older, root-run versions keep working. Note that this changes the owner of a bind-mounted data directory on the host to uid 1000.
+
 ## How It Works
 
 1. **Subscribe to ntfy topics**: The bridge connects to one or more ntfy topics via HTTP streaming.
@@ -235,9 +237,10 @@ The service is configured with environment variables:
 
 The service automatically handles reconnections, retries, and error recovery:
 
-- A dropped or silent ntfy connection (no keepalive for 90 seconds) is re-established with exponential backoff, and the bridge asks ntfy for every message published while it was disconnected. This resume point lives in memory, so messages published while the bridge itself is stopped (e.g. during a restart or redeploy) are not replayed.
+- A dropped or silent ntfy connection (no keepalive for 90 seconds) is re-established with exponential backoff, and the bridge asks ntfy for every message published while it was disconnected.
+- Each mapping's resume point is saved in the database, so messages published while the bridge itself is stopped (e.g. during a restart or redeploy) are delivered once it is back, as long as ntfy still has them cached (12 hours by default).
 - Authentication or "topic not found" errors are retried every 5 minutes, so a misconfigured mapping does not hammer the ntfy server.
-- Discord rate limits and server errors are retried up to 3 times; messages Discord rejects outright (e.g. a deleted webhook) are logged and skipped.
+- Discord rate limits, server errors and failed connections are retried up to 3 times; messages Discord rejects outright (e.g. a deleted webhook) are logged and skipped. If the connection breaks after a message was sent, it is not retried: Discord may already have posted it, and a retry could post it twice.
 
 ## Development
 

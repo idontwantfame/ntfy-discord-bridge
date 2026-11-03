@@ -1,16 +1,14 @@
-"""Ntfy integration module."""
+"""Ntfy JSON stream client that keeps a topic subscription alive."""
 
 import asyncio
 import json
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Awaitable, Callable
 from contextlib import aclosing
 from typing import Any
 
 import httpx
 
-from app.core.auth import describe_auth
 from app.core.logging import log
-from app.discord import post_to_discord
 
 # Ntfy sends a keepalive event every 45 seconds by default (and servers must stay
 # below the Android app's hardcoded 77 second timeout), so a stream that stays
@@ -21,6 +19,8 @@ CONNECT_TIMEOUT = 10.0
 # Reconnect delays in seconds: doubled after each failure, reset by any event
 RETRY_INITIAL_DELAY = 1.0
 RETRY_MAX_DELAY = 300.0
+
+ResumePointCallback = Callable[[str], Awaitable[None]]
 
 
 async def _iter_events(
@@ -65,6 +65,23 @@ def _resume_point(event: dict[str, Any], since: str | None) -> str | None:
     return since
 
 
+async def _advance(
+    event: dict[str, Any],
+    since: str | None,
+    on_resume_point: ResumePointCallback | None,
+) -> str | None:
+    """Move the resume point past a handled event, reporting any change.
+
+    Returns:
+        The new resume point.
+
+    """
+    resume_point = _resume_point(event, since)
+    if resume_point is not None and resume_point != since and on_resume_point:
+        await on_resume_point(resume_point)
+    return resume_point
+
+
 def _delay_after_status_error(
     error: httpx.HTTPStatusError,
     mapping_id: int,
@@ -103,21 +120,31 @@ def _delay_after_status_error(
     return RETRY_MAX_DELAY
 
 
-async def _subscribe(
+async def subscribe(
     client: httpx.AsyncClient,
     ntfy_url: str,
     mapping_id: int,
+    since: str | None = None,
+    on_resume_point: ResumePointCallback | None = None,
 ) -> AsyncIterator[dict[str, Any]]:
     """Yield Ntfy events forever, reconnecting whenever the stream drops.
 
     Every reconnect passes Ntfy a ``since`` parameter (see `_resume_point`), so
     messages published while disconnected are delivered after reconnecting.
+    The resume point only moves past an event once the consumer asks for the
+    next one, so an event being handled when the process dies is replayed.
+
+    Args:
+        client: The Ntfy HTTP client.
+        ntfy_url: The Ntfy JSON stream URL.
+        mapping_id: The mapping ID.
+        since: Where to start, e.g. a resume point saved before a restart.
+        on_resume_point: Called with every new resume point, e.g. to save it.
 
     Yields:
         Each event received from Ntfy.
 
     """
-    since: str | None = None
     delay = RETRY_INITIAL_DELAY
     while True:
         params = {"since": since} if since else {}
@@ -136,9 +163,9 @@ async def _subscribe(
                 async for event in events:
                     # Only a stream that delivers events counts as healthy
                     delay = RETRY_INITIAL_DELAY
-                    since = _resume_point(event, since)
                     # Safe: every consumer closes this generator via aclosing()
                     yield event  # noqa: ASYNC119
+                    since = await _advance(event, since, on_resume_point)
             log.warning(
                 "[ID: %(mapping_id)s] Ntfy closed the stream. Reconnecting...",
                 {"mapping_id": mapping_id},
@@ -152,49 +179,3 @@ async def _subscribe(
             )
         await asyncio.sleep(delay)
         delay = min(delay * 2, RETRY_MAX_DELAY)
-
-
-async def listen_to_ntfy(mapping: dict[str, Any]) -> None:
-    """Forward messages from a Ntfy topic to a Discord webhook until cancelled.
-
-    Args:
-        mapping: The mapping dictionary from the database.
-
-    """
-    mapping_id = mapping["id"]
-    server = mapping["ntfy_server"]
-    topic = mapping["ntfy_topic"]
-    auth_header = mapping.get("ntfy_auth_header")
-
-    ntfy_url = f"{server.rstrip('/')}/{topic.lstrip('/')}/json"
-    headers = {
-        "User-Agent": "ntfy-discord-bridge/0.1.0",
-        "Accept": "application/x-ndjson, application/json",
-    }
-    if auth_header:
-        headers["Authorization"] = auth_header
-
-    log.info(
-        "[ID: %(mapping_id)s] Starting listening to Ntfy: %(url)s (auth: %(auth)s)",
-        {"mapping_id": mapping_id, "url": ntfy_url, "auth": describe_auth(auth_header)},
-    )
-
-    # Use a separate Discord session to not block Ntfy connections
-    stream_timeout = httpx.Timeout(CONNECT_TIMEOUT, read=STREAM_READ_TIMEOUT)
-    async with (
-        httpx.AsyncClient() as discord_client,
-        httpx.AsyncClient(
-            headers=headers,
-            timeout=stream_timeout,
-            follow_redirects=True,
-        ) as ntfy_client,
-        aclosing(_subscribe(ntfy_client, ntfy_url, mapping_id)) as events,
-    ):
-        async for event in events:
-            if event.get("event") != "message":
-                continue
-            log.info(
-                "[ID: %(mapping_id)s] Received message: %(title)s",
-                {"mapping_id": mapping_id, "title": event.get("title")},
-            )
-            await post_to_discord(discord_client, mapping["discord_webhook"], event)

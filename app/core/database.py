@@ -15,10 +15,11 @@ DB_PATH = os.environ.get("DB_PATH", str(DEFAULT_DB_PATH))
 
 
 async def init_db() -> None:
-    """Create the mappings table if it doesn't exist."""
+    """Create the mappings table if it doesn't exist and migrate older schemas."""
     pathlib.Path(DB_PATH).parent.mkdir(exist_ok=True, parents=True)
 
     async with aiosqlite.connect(DB_PATH) as db:
+        # ntfy_since: where the Ntfy stream resumes after a restart
         await db.execute("""
             CREATE TABLE IF NOT EXISTS mappings (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -26,9 +27,15 @@ async def init_db() -> None:
                 ntfy_topic TEXT NOT NULL,
                 discord_webhook TEXT NOT NULL,
                 ntfy_auth_header TEXT,
+                ntfy_since TEXT,
                 UNIQUE(ntfy_server, ntfy_topic, discord_webhook)
             )
         """)
+        # Databases created by older versions lack the ntfy_since column
+        async with db.execute("PRAGMA table_info(mappings)") as cursor:
+            columns = {row[1] async for row in cursor}
+        if "ntfy_since" not in columns:
+            await db.execute("ALTER TABLE mappings ADD COLUMN ntfy_since TEXT")
         await db.commit()
 
 
@@ -88,6 +95,22 @@ async def remove_mapping(mapping_id: int) -> bool:
             return False
         log.info("Mapping removed with ID: %s", mapping_id)
         return True
+
+
+async def update_since(mapping_id: int, since: str) -> None:
+    """Save where a mapping's Ntfy stream should resume after a restart.
+
+    Args:
+        mapping_id: The mapping ID.
+        since: The Ntfy ``since`` value (a message ID or a Unix time).
+
+    """
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute(
+            "UPDATE mappings SET ntfy_since = ? WHERE id = ?",
+            (since, mapping_id),
+        )
+        await db.commit()
 
 
 async def list_mappings() -> list[dict[str, Any]]:

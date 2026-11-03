@@ -46,7 +46,7 @@ Serwis przekierowujący powiadomienia z tematów [ntfy](https://ntfy.sh/) do web
 - Obsługuje uwierzytelnione serwery ntfy (Basic i Bearer).
 - Dynamiczne zarządzanie: dodawaj lub usuwaj mapowania w czasie rzeczywistym bez restartu (zmiany są wykrywane w ciągu 30 sekund).
 - Solidna obsługa błędów i automatyczne ponowne połączenie z wykładniczym backoffem.
-- Brak utraconych powiadomień przy ponownym połączeniu: most wznawia odbiór w miejscu, w którym przerwano strumień.
+- Brak utraconych powiadomień: most pamięta, w którym miejscu przerwano każdy strumień, także po restarcie i ponownym wdrożeniu.
 - Respektuje limity zapytań Discorda i ponawia nieudane wysyłki.
 - Sekrety nie trafiają do logów: tokeny webhooków i dane logowania ntfy nigdy nie są wypisywane.
 - Proste narzędzie zarządzania CLI (`cli.py`): dodawaj/wyświetlaj/usuwaj mapowania tematów do webhooków.
@@ -225,6 +225,8 @@ Serwis konfiguruje się za pomocą zmiennych środowiskowych:
 | `DB_PATH` | `data/bridge.db` w katalogu projektu (`/app/data/bridge.db` w Dockerze) | Ścieżka bazy SQLite z mapowaniami |
 | `LOG_LEVEL` | `INFO` | Szczegółowość logów: `DEBUG`, `INFO`, `WARNING` lub `ERROR` |
 
+Kontener Dockera działa jako nieuprzywilejowany użytkownik (`app`, uid 1000). Przy starcie przekazuje mu katalog danych, więc wolumeny utworzone przez starsze wersje działające jako root nadal działają. Uwaga: zmienia to właściciela zamontowanego katalogu danych na hoście na uid 1000.
+
 ## Jak to działa
 
 1. **Subskrybuj tematy ntfy**: Most łączy się z jednym lub więcej tematami ntfy za pomocą strumieniowania HTTP.
@@ -235,9 +237,10 @@ Serwis konfiguruje się za pomocą zmiennych środowiskowych:
 
 Serwis automatycznie obsługuje ponowne połączenia, ponowne próby i odzyskiwanie błędów:
 
-- Zerwane lub milczące połączenie z ntfy (brak keepalive przez 90 sekund) jest odnawiane z wykładniczym backoffem, a most prosi ntfy o wszystkie wiadomości opublikowane w czasie rozłączenia. Ten punkt wznowienia jest przechowywany w pamięci, więc wiadomości opublikowane, gdy sam most jest zatrzymany (np. podczas restartu lub ponownego wdrożenia), nie są odtwarzane.
+- Zerwane lub milczące połączenie z ntfy (brak keepalive przez 90 sekund) jest odnawiane z wykładniczym backoffem, a most prosi ntfy o wszystkie wiadomości opublikowane w czasie rozłączenia.
+- Punkt wznowienia każdego mapowania jest zapisywany w bazie danych, więc wiadomości opublikowane, gdy sam most jest zatrzymany (np. podczas restartu lub ponownego wdrożenia), zostaną dostarczone po jego uruchomieniu, o ile ntfy wciąż ma je w pamięci podręcznej (domyślnie 12 godzin).
 - Błędy uwierzytelniania lub nieistniejącego tematu są ponawiane co 5 minut, więc błędnie skonfigurowane mapowanie nie zasypuje serwera ntfy zapytaniami.
-- Limity zapytań i błędy serwera Discorda są ponawiane do 3 razy; wiadomości odrzucone przez Discorda (np. usunięty webhook) są logowane i pomijane.
+- Limity zapytań, błędy serwera i nieudane połączenia z Discordem są ponawiane do 3 razy; wiadomości odrzucone przez Discorda (np. usunięty webhook) są logowane i pomijane. Jeśli połączenie zerwie się po wysłaniu wiadomości, nie jest ona ponawiana: Discord mógł ją już opublikować, a ponowna próba mogłaby ją zdublować.
 
 ## Rozwój
 

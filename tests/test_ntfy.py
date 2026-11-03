@@ -17,10 +17,15 @@ def stream(*events: dict) -> httpx.Response:
     return httpx.Response(200, text=ndjson(*events))
 
 
-async def take(client: httpx.AsyncClient, count: int) -> list[dict]:
+async def take(
+    client: httpx.AsyncClient,
+    count: int,
+    **subscribe_kwargs: object,
+) -> list[dict]:
     """Collect the first `count` message events from a subscription."""
     messages: list[dict] = []
-    async with aclosing(ntfy._subscribe(client, NTFY_URL, 1)) as events:
+    subscription = ntfy.subscribe(client, NTFY_URL, 1, **subscribe_kwargs)
+    async with aclosing(subscription) as events:
         while len(messages) < count:
             event = await anext(events)
             if event["event"] == "message":
@@ -39,6 +44,35 @@ async def test_subscribe_skips_invalid_lines(replay, sleeps):
         messages = await take(client, 1)
     assert [m["id"] for m in messages] == ["a1"]
     assert sleeps == []
+
+
+@pytest.mark.usefixtures("sleeps")
+async def test_subscribe_starts_from_saved_resume_point(replay):
+    client, requests = replay(stream({"event": "message", "id": "b2"}))
+    async with client:
+        await take(client, 1, since="a1")
+    assert requests[0].url.params["since"] == "a1"
+
+
+@pytest.mark.usefixtures("sleeps")
+async def test_subscribe_reports_resume_points_once_events_are_handled(replay):
+    saved: list[str] = []
+
+    async def save(since: str) -> None:
+        saved.append(since)
+
+    client, _ = replay(
+        stream(
+            {"event": "open", "time": 5},
+            {"event": "keepalive", "time": 6},
+            {"event": "message", "id": "a1"},
+            {"event": "message", "id": "b2"},
+        ),
+    )
+    async with client:
+        await take(client, 2, on_resume_point=save)
+    # b2 was taken but its consumer never asked for more, so it is not saved
+    assert saved == ["5", "a1"]
 
 
 @pytest.mark.usefixtures("sleeps")
@@ -105,47 +139,3 @@ async def test_subscribe_retries_client_errors_at_max_delay(replay, sleeps, stat
     async with client:
         await take(client, 1)
     assert sleeps == [ntfy.RETRY_MAX_DELAY]
-
-
-class StopListeningError(Exception):
-    """Raised by the fake transport to end the otherwise endless listener."""
-
-
-async def test_listen_forwards_messages_with_auth(monkeypatch, sleeps):
-    ntfy_requests: list[httpx.Request] = []
-    discord_requests: list[httpx.Request] = []
-
-    def handler(request: httpx.Request) -> httpx.Response:
-        if request.url.host == "discord.com":
-            discord_requests.append(request)
-            return httpx.Response(204)
-        ntfy_requests.append(request)
-        if len(ntfy_requests) > 1:
-            raise StopListeningError
-        return stream(
-            {"event": "open", "time": 1},
-            {"event": "message", "id": "a1", "title": "hi"},
-        )
-
-    real_client = httpx.AsyncClient
-    monkeypatch.setattr(
-        httpx,
-        "AsyncClient",
-        lambda **kw: real_client(transport=httpx.MockTransport(handler), **kw),
-    )
-    mapping = {
-        "id": 7,
-        "ntfy_server": "https://ntfy.example/",
-        "ntfy_topic": "/alerts",
-        "discord_webhook": "https://discord.com/api/webhooks/1/token",
-        "ntfy_auth_header": "Bearer secret",
-    }
-
-    with pytest.raises(StopListeningError):
-        await ntfy.listen_to_ntfy(mapping)
-
-    assert str(ntfy_requests[0].url) == NTFY_URL
-    assert ntfy_requests[0].headers["Authorization"] == "Bearer secret"
-    assert ntfy_requests[1].url.params["since"] == "a1"
-    assert json.loads(discord_requests[0].content)["embeds"][0]["title"].endswith("hi")
-    assert sleeps == [ntfy.RETRY_INITIAL_DELAY]
